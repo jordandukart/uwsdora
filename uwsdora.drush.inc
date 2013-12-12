@@ -23,6 +23,17 @@ function uwsdora_drush_command() {
     ),
     'bootstrap' => DRUSH_BOOTSTRAP_DRUPAL_LOGIN,
   );
+  $commands['uwsdora-update-modscollection'] = array(
+    'description' => dt('Strip off the superfluous ModsCollection wrapper from the UWS Thesis Collection'),
+    'drupal dependencies' => array(
+      'islandora',
+      'uwsdora',
+    ),
+    'examples' => array(
+      'drush -u 1 uwsdora-update-modscollection' => dt('Updating MODS records.'),
+    ),
+    'boostrap' => DRUSH_BOOTSTRAP_DRUPAL_LOGIN,
+  );
   return $commands;
 }
 
@@ -131,5 +142,91 @@ function uwsdora_update_handles_batch_operation(&$context) {
     }
   }
   $sandbox['offset'] += $handle_update;
+  $context['finished'] = $sandbox['offset'] / $sandbox['total'];
+}
+
+/**
+ * Command callback to remove the MODSCollection element from MODS.
+ */
+function drush_uwsdora_update_modscollection() {
+  batch_set(uwsdora_update_modscollection_create_batch());
+  drush_backend_batch_process();
+}
+
+/**
+ * Constructs a batch used to update things via Drush.
+ */
+function uwsdora_update_modscollection_create_batch() {
+  return array(
+    'operations' => array(
+      array('uwsdora_update_modscollection_batch_operation', array()),
+    ),
+    'title' => t('Updating MODS for Thesis Collection...'),
+    'init_message' => t('Preparing to update MODS records.'),
+    'progress_message' => t('Time elapsed: @elapsed <br/>Estimated time remaning @estimate.'),
+    'error_message' => t('An error has occurred.'),
+    'file' => drupal_get_path('module', 'uwsdora') . '/uwsdora.drush.inc',
+  );
+}
+
+/**
+ * Constructs and performs the modsCollection update batch operation.
+ *
+ * @param array $context
+ *   The context of the Drupal batch.
+ */
+function uwsdora_update_modscollection_batch_operation(&$context) {
+  $mods_update = 10;
+  $query = <<<EOQ
+SELECT ?pid FROM <#ri>
+WHERE {
+  ?pid <fedora-rels-ext:isMemberOfCollection> <info:fedora/uws:thesisCollection> ;
+}
+EOQ;
+  $connection = islandora_get_tuque_connection();
+  $sandbox = &$context['sandbox'];
+  if (!isset($sandbox['offset'])) {
+    $sparql_count = $connection->repository->ri->countQuery($query, 'sparql');
+    $sandbox['offset'] = 0;
+    $sandbox['total'] = $sparql_count;
+    if ($sandbox['total'] === 0) {
+      return;
+    }
+  }
+
+  $context['message'] = t('Processing results @start to @end.', array(
+    '@start' => $sandbox['offset'],
+    '@end' => min($sandbox['offset'] + $mods_update, $sandbox['total']),
+  ));
+
+  $offset_start = $sandbox['offset'];
+  $query .= "
+  LIMIT $mods_update
+  OFFSET $offset_start
+  ";
+  module_load_include('inc', 'islandora', 'includes/derivatives');
+  $results = $connection->repository->ri->sparqlQuery($query);
+  foreach ($results as $result) {
+    $object = islandora_object_load($result['pid']['value']);
+    if ($object && isset($object['MODS'])) {
+      $dom = new DOMDocument();
+      $dom->loadXML($object['MODS']->content);
+      if ($dom->documentElement->tagName == 'modsCollection') {
+        $new_dom = new DOMDocument('1.0', 'UTF-8');
+        $new_dom->formatOutput = TRUE;
+        $new_node = $new_dom->importNode($dom->getElementsByTagName('mods')->item(0), TRUE);
+        $new_dom->appendChild($new_node);
+        $object['MODS']->content = $new_dom->saveXML();
+        drush_log(dt('Updated the MODS record for @object!', array('@object' => $result['pid']['value'])), 'success');
+      }
+      else {
+        drush_log(dt('The object @object did not have the modsCollection wrapper on it', array('@object' => $result['pid']['value'])), 'notice');
+      }
+    }
+    else {
+      drush_log(dt("The object @object does not exist or it does not have a MODS datastream!", array('@object' => $result['pid']['value'])), 'error');
+    }
+  }
+  $sandbox['offset'] += $mods_update;
   $context['finished'] = $sandbox['offset'] / $sandbox['total'];
 }
